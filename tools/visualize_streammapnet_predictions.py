@@ -178,7 +178,7 @@ def main():
                       help='Output directory for visualizations')
     parser.add_argument('--num-samples', type=int, default=100,
                       help='Number of samples to visualize')
-    parser.add_argument('--confidence-threshold', type=float, default=0.4,
+    parser.add_argument('--confidence-threshold', type=float, default=0.3,
                       help='Confidence threshold for predictions')
     parser.add_argument('--pc-range', type=float, nargs=6,
                       default=[-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
