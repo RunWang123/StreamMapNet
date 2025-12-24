@@ -225,7 +225,7 @@ model = dict(
 )
 
 
-data_root = '/home/runw/Project/data/mini/nuscenes/'
+data_root = '/scratch/runw/project/maptr/data_full/nuscenes/'
 
 # data processing pipelines
 train_pipeline = [
