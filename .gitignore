@@ -142,3 +142,4 @@ demo/
 # softlinks
 av2
 nuScenes
+output/
