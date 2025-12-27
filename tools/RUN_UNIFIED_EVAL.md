@@ -1,6 +1,22 @@
 # How to Run StreamMapNet Unified Evaluation Script
 
 ## Quick Start
+```bash
+python tools/streammapnet_eval_unified.py   --cameras CAM_FRONT   --predictions-pkl predictions_front.pkl   --output-json results_front.json --config config/nusc_baseline_480_60x30_30e.py --checkpoint ckpts/nusc_baseline_480_60x30_30e.pth --nuscenes-path /scratch/runw/project/maptr/data_full/nuscenes --samples-pkl /scratch/runw/project/maptr/data_full/nuscenes/nuscenes_infos_temporal_val.pkl
+```
+
+
+```bash
+python tools/streammapnet_eval_unified.py   --cameras CAM_BACK   --predictions-pkl predictions_back.pkl   --output-json results_back.json --config config/nusc_baseline_480_60x30_30e.py --checkpoint ckpts/nusc_baseline_480_60x30_30e.pth --nuscenes-path /scratch/runw/project/maptr/data_full/nuscenes --samples-pkl /scratch/runw/project/maptr/data_full/nuscenes/nuscenes_infos_temporal_val.pkl
+```
+
+```bash
+python tools/streammapnet_eval_unified.py   --cameras CAM_FRONT,CAM_BACK   --predictions-pkl predictions_front_back.pkl   --output-json results_front_back.json --config config/nusc_baseline_480_60x30_30e.py --checkpoint ckpts/nusc_baseline_480_60x30_30e.pth --nuscenes-path /scratch/runw/project/maptr/data_full/nuscenes --samples-pkl /scratch/runw/project/maptr/data_full/nuscenes/nuscenes_infos_temporal_val.pkl
+```
+
+```bash
+python tools/streammapnet_eval_unified.py   --cameras all   --predictions-pkl predictions_all.pkl   --output-json results_all.json --config config/nusc_baseline_480_60x30_30e.py --checkpoint ckpts/nusc_baseline_480_60x30_30e.pth --nuscenes-path /scratch/runw/project/maptr/data_full/nuscenes --samples-pkl /scratch/runw/project/maptr/data_full/nuscenes/nuscenes_infos_temporal_val.pkl
+```
 
 ### 1. Basic Usage (All 6 Cameras)
 
