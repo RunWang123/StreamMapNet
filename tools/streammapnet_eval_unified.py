@@ -1176,7 +1176,7 @@ Examples:
     
     # Inference arguments
     parser.add_argument('--config', type=str,
-                       default='/home/runw/Project/StreamMapNet/plugin/configs/nusc_baseline_480_60x30_30e.py',
+                       default='/home/runw/Project/StreamMapNet/config/nusc_baseline_480_60x30_30e.py',
                        help='StreamMapNet config file path')
     parser.add_argument('--checkpoint', type=str,
                        default='/home/runw/Project/StreamMapNet/ckpts/nusc_baseline_480_60x30_30e.pth',
