@@ -312,12 +312,15 @@ def run_streammapnet_inference(
     output_pkl: str,
     camera_indices: List[int],
     score_thresh: float = 0.0,
-    samples_pkl: str = None,
-    nuscenes_path: str = None
+    samples_pkl: str = None
 ) -> str:
     """
     Run StreamMapNet inference with specified camera configuration.
     Includes StreamMapNet-specific denormalization and coordinate rotation.
+    
+    Note: Does NOT override cfg.data.test.data_root to avoid path doubling issues.
+    The annotation file paths may already be absolute, or they will be relative
+    to the config's data_root setting.
     """
     print("\n" + "="*80)
     print("STEP 1: Running StreamMapNet Inference")
@@ -325,10 +328,9 @@ def run_streammapnet_inference(
     
     cfg = Config.fromfile(config_path)
     
-    # Override dataset paths if provided
-    if nuscenes_path is not None:
-        cfg.data.test.data_root = nuscenes_path
-        print(f"Overriding NuScenes data root to: {nuscenes_path}")
+    # Note: We do NOT override data_root here because the annotation file paths may already be absolute
+    # If they are relative, they will be relative to the config's data_root setting
+    # Overriding samples_pkl is still needed for --samples-pkl argument
     if samples_pkl is not None:
         cfg.data.test.ann_file = samples_pkl
         print(f"Overriding dataset annotation file to: {samples_pkl}")
@@ -1164,8 +1166,8 @@ Examples:
             output_pkl=args.predictions_pkl,
             camera_indices=camera_indices,
             score_thresh=args.score_thresh,
-            samples_pkl=args.samples_pkl,
-            nuscenes_path=args.nuscenes_path
+            samples_pkl=args.samples_pkl
+            # Note: nuscenes_path removed - we don't override data_root to avoid path doubling
         )
     else:
         print("\n" + "="*80)
