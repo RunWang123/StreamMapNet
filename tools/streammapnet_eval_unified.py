@@ -709,7 +709,7 @@ class CameraSpecificEvaluator:
         self,
         nuscenes_data_path: str,
         pc_range: List[float] = None,
-        num_sample_pts: int = 100,
+        num_sample_pts: int = 200,  # CRITICAL: Match original INTERP_NUM=200 for correct mAP!
         thresholds_chamfer: List[float] = None,
         camera_names: List[str] = None
     ):
@@ -717,7 +717,7 @@ class CameraSpecificEvaluator:
         Args:
             nuscenes_data_path: Path to NuScenes dataset
             pc_range: BEV range [-x, -y, -z, x, y, z]
-            num_sample_pts: Number of points to resample vectors to (MUST match training: 100)
+            num_sample_pts: Number of points to resample vectors to (must match original: 200)
             thresholds_chamfer: Chamfer distance thresholds (MapTR uses [0.5, 1.0, 1.5])
             camera_names: List of camera names to evaluate
         """
@@ -1100,55 +1100,113 @@ class CameraSpecificEvaluator:
     
     def evaluate(self) -> Dict:
         """
-        Compute final metrics across all cameras and classes.
+        Compute final metrics by aggregating ALL camera predictions (matches MapTR/GeMap).
+        
+        This aggregates predictions from all cameras per sample, then evaluates ONCE
+        per class, matching the original evaluation methodology for fair comparison.
         """
         results = {}
         class_names = ['divider', 'ped_crossing', 'boundary']
         
-        for camera_name in self.camera_names:
-            camera_results = {}
-            all_aps = []
+        # AGGREGATE: Merge all camera predictions per sample
+        print("\nAggregating predictions across all cameras...")
+        
+        aggregated_preds = []  # List of {vectors, labels, scores} per sample
+        aggregated_gts = []    # List of {vectors, labels} per sample
+        
+        num_samples = len(self.predictions_per_camera[self.camera_names[0]])
+        
+        for sample_idx in range(num_samples):
+            # Collect predictions from ALL cameras for this sample
+            sample_pred_vectors = []
+            sample_pred_labels = []
+            sample_pred_scores = []
             
-            camera_preds = self.predictions_per_camera[camera_name]
-            camera_gts = self.ground_truths_per_camera[camera_name]
+            sample_gt_vectors = []
+            sample_gt_labels = []
             
-            # Evaluate each class
-            for class_id, class_name in enumerate(class_names):
-                class_results = {}
+            for camera_name in self.camera_names:
+                pred_data = self.predictions_per_camera[camera_name][sample_idx]
+                gt_data = self.ground_truths_per_camera[camera_name][sample_idx]
                 
-                # Extract predictions and GT for this class
-                pred_vectors_list = []
-                pred_scores_list = []
-                gt_vectors_list = []
+                # Append predictions
+                if len(pred_data['vectors']) > 0:
+                    sample_pred_vectors.append(pred_data['vectors'])
+                    sample_pred_labels.append(pred_data['labels'])
+                    sample_pred_scores.append(pred_data['scores'])
                 
-                for pred_data, gt_data in zip(camera_preds, camera_gts):
-                    pred_mask = pred_data['labels'] == class_id
-                    gt_mask = gt_data['labels'] == class_id
-                    
-                    pred_vectors_list.append(pred_data['vectors'][pred_mask])
-                    pred_scores_list.append(pred_data['scores'][pred_mask])
-                    gt_vectors_list.append(gt_data['vectors'][gt_mask])
-                
-                # Compute AP at each threshold
-                avg_cd = None
-                for threshold in self.thresholds_chamfer:
-                    ap, cd = self.compute_ap_for_class(
-                        pred_vectors_list, pred_scores_list, gt_vectors_list, threshold)
-                    
-                    class_results[f'AP@{threshold}m'] = ap
-                    all_aps.append(ap)
-                    
-                    if avg_cd is None:
-                        avg_cd = cd
-                
-                class_results['avg_chamfer_distance'] = avg_cd if avg_cd is not None else float('inf')
-                
-                camera_results[class_name] = class_results
+                # Append GT
+                if len(gt_data['vectors']) > 0:
+                    sample_gt_vectors.append(gt_data['vectors'])
+                    sample_gt_labels.append(gt_data['labels'])
             
-            # Compute mAP
-            camera_results['mAP'] = np.mean(all_aps) if all_aps else 0.0
+            # Merge across cameras
+            if sample_pred_vectors:
+                merged_pred_vectors = np.vstack(sample_pred_vectors)
+                merged_pred_labels = np.concatenate(sample_pred_labels)
+                merged_pred_scores = np.concatenate(sample_pred_scores)
+            else:
+                merged_pred_vectors = np.array([]).reshape(0, self.num_sample_pts, 2)
+                merged_pred_labels = np.array([])
+                merged_pred_scores = np.array([])
             
-            results[camera_name] = camera_results
+            if sample_gt_vectors:
+                merged_gt_vectors = np.vstack(sample_gt_vectors)
+                merged_gt_labels = np.concatenate(sample_gt_labels)
+            else:
+                merged_gt_vectors = np.array([]).reshape(0, self.num_sample_pts, 2)
+                merged_gt_labels = np.array([])
+            
+            aggregated_preds.append({
+                'vectors': merged_pred_vectors,
+                'labels': merged_pred_labels,
+                'scores': merged_pred_scores
+            })
+            
+            aggregated_gts.append({
+                'vectors': merged_gt_vectors,
+                'labels': merged_gt_labels
+            })
+        
+        print(f"✓ Aggregated {num_samples} samples across {len(self.camera_names)} cameras")
+        
+        # EVALUATE: Compute metrics ONCE per class (like MapTR/GeMap)
+        all_aps = []
+        
+        for class_id, class_name in enumerate(class_names):
+            class_results = {}
+            
+            # Extract predictions and GT for this class across ALL samples
+            pred_vectors_list = []
+            pred_scores_list = []
+            gt_vectors_list = []
+            
+            for pred_data, gt_data in zip(aggregated_preds, aggregated_gts):
+                pred_mask = pred_data['labels'] == class_id
+                gt_mask = gt_data['labels'] == class_id
+                
+                pred_vectors_list.append(pred_data['vectors'][pred_mask])
+                pred_scores_list.append(pred_data['scores'][pred_mask])
+                gt_vectors_list.append(gt_data['vectors'][gt_mask])
+            
+            # Compute AP at each threshold
+            avg_cd = None
+            for threshold in self.thresholds_chamfer:
+                ap, cd = self.compute_ap_for_class(
+                    pred_vectors_list, pred_scores_list, gt_vectors_list, threshold)
+                
+                class_results[f'AP@{threshold}m'] = ap
+                all_aps.append(ap)
+                
+                if avg_cd is None:
+                    avg_cd = cd
+            
+            class_results['avg_chamfer_distance'] = avg_cd if avg_cd is not None else float('inf')
+            
+            results[class_name] = class_results
+        
+        # Compute overall mAP (matches MapTR/GeMap methodology)
+        results['mAP'] = np.mean(all_aps) if all_aps else 0.0
         
         return results
 
@@ -1321,29 +1379,28 @@ Examples:
     
     # Print results
     print("\n" + "="*80)
-    print("EVALUATION RESULTS")
+    print("EVALUATION RESULTS (Aggregated across all cameras)")
     print("="*80)
     
     class_names = ['divider', 'ped_crossing', 'boundary']
     
-    for camera_name, camera_results in results.items():
-        print(f"\n{camera_name}:")
-        
-        if 'mAP' in camera_results:
-            print(f"  mAP (all classes & thresholds): {camera_results['mAP']:.4f}")
-        
+    if 'mAP' in results:
+        print(f"\n{'='*80}")
+        print(f"Overall mAP (all classes & thresholds): {results['mAP']:.4f}")
+        print(f"{'='*80}\n")
+    
+    for class_name in class_names:
+        if class_name not in results:
+            continue
+        class_results = results[class_name]
+        print(f"{class_name}:")
+        for threshold in evaluator.thresholds_chamfer:
+            ap = class_results[f'AP@{threshold}m']
+            print(f"  AP@{threshold}m: {ap:.4f}")
+        cd = class_results['avg_chamfer_distance']
+        cd_str = f"{cd:.4f}m" if cd != float('inf') else "N/A"
+        print(f"  Avg CD: {cd_str}")
         print()
-        for class_name in class_names:
-            if class_name not in camera_results:
-                continue
-            class_results = camera_results[class_name]
-            print(f"  {class_name}:")
-            for threshold in evaluator.thresholds_chamfer:
-                ap = class_results[f'AP@{threshold}m']
-                print(f"    AP@{threshold}m: {ap:.4f}")
-            cd = class_results['avg_chamfer_distance']
-            cd_str = f"{cd:.4f}m" if cd != float('inf') else "N/A"
-            print(f"    Avg CD: {cd_str}")
     
     # Save results
     print(f"\nSaving results to {args.output_json}...")
