@@ -369,8 +369,80 @@ def run_streammapnet_inference(
     # Build dataset
     dataset = build_dataset(cfg.data.test)
     
-    # Patch image paths after dataset creation
-    patch_image_paths(cfg, logger)
+    # Patch image paths to use correct data_root if needed (CRITICAL - from original script)
+    # Get data_root from dataset config
+    data_root = cfg.data.test.get('data_root', '')
+    if not data_root:
+        # Try to get from dataset object
+        if hasattr(dataset, 'data_root'):
+            data_root = dataset.data_root
+        elif hasattr(dataset, 'nusc') and hasattr(dataset.nusc, 'dataroot'):
+            data_root = dataset.nusc.dataroot
+    
+    if data_root:
+        from plugin.datasets.nusc_dataset import NuscDataset
+        original_get_sample = NuscDataset.get_sample
+        
+        def patched_get_sample_with_data_root(self, idx):
+            """Patched version that fixes image paths with correct data_root."""
+            input_dict = original_get_sample(self, idx)
+            
+            # Fix image paths to use correct data_root
+            fixed_img_filenames = []
+            for img_path in input_dict['img_filenames']:
+                if img_path:
+                    # Normalize the path
+                    img_path_abs = os.path.abspath(img_path) if not os.path.isabs(img_path) else img_path
+                    
+                    # If path doesn't exist, try to fix it using data_root
+                    if not os.path.exists(img_path_abs):
+                        # Remove leading ./ or relative path components
+                        img_path_clean = img_path.lstrip('./')
+                        
+                        # Check if it contains 'nuscenes/' to extract the relative part
+                        if 'nuscenes/' in img_path_clean:
+                            # Extract the part after 'nuscenes/'
+                            parts = img_path_clean.split('nuscenes/', 1)
+                            if len(parts) > 1:
+                                # Reconstruct with correct data_root
+                                fixed_path = os.path.join(data_root, parts[1])
+                                if os.path.exists(fixed_path):
+                                    fixed_img_filenames.append(fixed_path)
+                                    continue
+                        
+                        # Try joining with data_root/samples/ directly
+                        # Path format: ./data/nuscenes/samples/CAM_FRONT/...
+                        # We want: data_root/samples/CAM_FRONT/...
+                        if 'samples/' in img_path_clean:
+                            parts = img_path_clean.split('samples/', 1)
+                            if len(parts) > 1:
+                                fixed_path = os.path.join(data_root, 'samples', parts[1])
+                                if os.path.exists(fixed_path):
+                                    fixed_img_filenames.append(fixed_path)
+                                    continue
+                        
+                        # Last resort: try joining with data_root directly
+                        fixed_path = os.path.join(data_root, img_path_clean)
+                        if os.path.exists(fixed_path):
+                            fixed_img_filenames.append(fixed_path)
+                        else:
+                            # Keep original path if fixed path doesn't exist
+                            logger.warning(f"Could not find image at {img_path} or {fixed_path}")
+                            fixed_img_filenames.append(img_path)
+                    else:
+                        # Path exists, use it as-is
+                        fixed_img_filenames.append(img_path_abs)
+                else:
+                    fixed_img_filenames.append(img_path)
+            
+            input_dict['img_filenames'] = fixed_img_filenames
+            return input_dict
+        
+        NuscDataset.get_sample = patched_get_sample_with_data_root
+        logger.info(f'Patched NuscDataset.get_sample to fix image paths with data_root: {data_root}')
+    
+    # Note: We do NOT call patch_image_paths() here because it causes path doubling
+    # The comprehensive path-fixing logic above handles all path scenarios correctly
     
     data_loader = build_dataloader(
         dataset,
