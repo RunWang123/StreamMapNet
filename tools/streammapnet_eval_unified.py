@@ -731,7 +731,6 @@ def run_streammapnet_inference(
                                 
                                 # Reshape back to (N_inst, N_pts, 2)
                                 pred_vectors = preds_lidar[:, :2].reshape(original_shape)
-                                logger.info(f'Applied Full Ego->Lidar Transform')
                             else:
                                 # Fallback
                                 pred_vectors_rotated = pred_vectors.copy()
@@ -900,7 +899,6 @@ def run_streammapnet_inference(
                             
                             # Reshape back to (N_inst, N_pts, 2)
                             pred_vectors = preds_lidar[:, :2].reshape(original_shape)
-                            logger.info(f'Applied Full Ego->Lidar Transform. Matrix:\n{e2l_mat}')
                         else:
                             # Fallback if no matrix found (should not happen)
                             logger.warning("Could not find lidar2ego info, creating manual rotation fallback")
