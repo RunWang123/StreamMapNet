@@ -39,9 +39,17 @@ class NuscDataset(BaseMapDataset):
             list[dict]: List of annotations.
         """
         
+        
         start_time = time()
         ann = mmcv.load(ann_file)
-        samples = ann[::self.interval]
+        
+        # Handle both formats:
+        # - Official format: direct list
+        # - Temporal format: dict with 'infos' key
+        if isinstance(ann, dict) and 'infos' in ann:
+            samples = ann['infos'][::self.interval]
+        else:
+            samples = ann[::self.interval]
         
         print(f'collected {len(samples)} samples in {(time() - start_time):.2f}s')
         self.samples = samples
@@ -58,10 +66,16 @@ class NuscDataset(BaseMapDataset):
         """
 
         sample = self.samples[idx]
-        location = sample['location']
         
-        map_geoms = self.map_extractor.get_map_geom(location, sample['e2g_translation'], 
-                sample['e2g_rotation'])
+        # Handle key name differences between formats
+        # Official: 'location', Temporal: 'map_location'
+        location = sample.get('location', sample.get('map_location'))
+        # Official: 'e2g_translation', Temporal: 'ego2global_translation'
+        e2g_translation = sample.get('e2g_translation', sample.get('ego2global_translation'))
+        # Official: 'e2g_rotation', Temporal: 'ego2global_rotation'
+        e2g_rotation = sample.get('e2g_rotation', sample.get('ego2global_rotation'))
+        
+        map_geoms = self.map_extractor.get_map_geom(location, e2g_translation, e2g_rotation)
 
         map_label2geom = {}
         for k, v in map_geoms.items():
@@ -69,14 +83,57 @@ class NuscDataset(BaseMapDataset):
                 map_label2geom[self.cat2id[k]] = v
         
         ego2img_rts = []
+        cam_intrinsics_list = []
+        cam_extrinsics_list = []
+        img_filenames_list = []
+        
         for c in sample['cams'].values():
-            extrinsic, intrinsic = np.array(
-                c['extrinsics']), np.array(c['intrinsics'])
+            # Handle intrinsics: Official: 'intrinsics', Temporal: 'cam_intrinsic'
+            intrinsic = np.array(c.get('intrinsics', c.get('cam_intrinsic')))
+            cam_intrinsics_list.append(intrinsic)
+            
+            # Handle extrinsics
+            if 'extrinsics' in c:
+                extrinsic = np.array(c['extrinsics'])
+            else:
+                # Temporal format: compute ego2cam from sensor2ego
+                # sensor2ego gives us cam2ego transformation
+                # We need ego2cam, which is the inverse
+                from scipy.spatial.transform import Rotation as R
+                sensor2ego_rot = c['sensor2ego_rotation']
+                sensor2ego_trans = c['sensor2ego_translation']
+                
+                # Convert quaternion [w, x, y, z] to [x, y, z, w] for scipy
+                quat_xyzw = [sensor2ego_rot[1], sensor2ego_rot[2], sensor2ego_rot[3], sensor2ego_rot[0]]
+                cam2ego_rot = R.from_quat(quat_xyzw).as_matrix()
+                cam2ego_trans = np.array(sensor2ego_trans)
+                
+                # Invert to get ego2cam
+                ego2cam_rot = cam2ego_rot.T
+                ego2cam_trans = -ego2cam_rot @ cam2ego_trans
+                
+                extrinsic = np.eye(4)
+                extrinsic[:3, :3] = ego2cam_rot
+                extrinsic[:3, 3] = ego2cam_trans
+            
+            cam_extrinsics_list.append(extrinsic)
+            
             ego2cam_rt = extrinsic
             viewpad = np.eye(4)
             viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
             ego2cam_rt = (viewpad @ ego2cam_rt)
             ego2img_rts.append(ego2cam_rt)
+            
+            # Handle image path: Official: 'img_fpath', Temporal: 'data_path'
+            img_path = c.get('img_fpath', c.get('data_path'))
+            # Temporal format may have relative paths like './data/nuscenes/samples/...'
+            if img_path and not img_path.startswith('/'):
+                if 'samples/' in img_path:
+                    # Extract 'samples/...' part for temporal format
+                    import os
+                    data_root = '/home/runw/Project/data/mini/nuscenes/'
+                    img_path = os.path.join(data_root, img_path[img_path.index('samples/'):])
+            img_filenames_list.append(img_path)
 
         # if sample['sample_idx'] == 0:
         #     is_first_frame = True
@@ -85,18 +142,20 @@ class NuscDataset(BaseMapDataset):
         input_dict = {
             'location': location,
             'token': sample['token'],
-            'img_filenames': [c['img_fpath'] for c in sample['cams'].values()],
+            'img_filenames': img_filenames_list,
             # intrinsics are 3x3 Ks
-            'cam_intrinsics': [c['intrinsics'] for c in sample['cams'].values()],
+            'cam_intrinsics': cam_intrinsics_list,
             # extrinsics are 4x4 tranform matrix, **ego2cam**
-            'cam_extrinsics': [c['extrinsics'] for c in sample['cams'].values()],
+            'cam_extrinsics': cam_extrinsics_list,
             'ego2img': ego2img_rts,
             'map_geoms': map_label2geom, # {0: List[ped_crossing(LineString)], 1: ...}
-            'ego2global_translation': sample['e2g_translation'], 
-            'ego2global_rotation': Quaternion(sample['e2g_rotation']).rotation_matrix.tolist(),
+            'ego2global_translation': e2g_translation, 
+            'ego2global_rotation': Quaternion(e2g_rotation).rotation_matrix.tolist(),
             # 'is_first_frame': is_first_frame, # deprecated
-            'sample_idx': sample['sample_idx'],
-            'scene_name': sample['scene_name']
+            # Official: 'sample_idx', Temporal: 'frame_idx'
+            'sample_idx': sample.get('sample_idx', sample.get('frame_idx', 0)),
+            # Official: 'scene_name', Temporal: 'scene_token'
+            'scene_name': sample.get('scene_name', sample.get('scene_token', ''))
             # 'group_idx': self.flag[sample['sample_idx']]
         }
 

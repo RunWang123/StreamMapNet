@@ -305,6 +305,65 @@ def patch_image_paths(cfg, logger):
         logger.warning(f'Could not patch image paths: {e}')
 
 
+# ==================== TEMPORAL/STREAMING HELPERS ====================
+def is_streaming_model(model):
+    """
+    Check if model uses temporal/streaming BEV features.
+    StreamMapNet maintains historical BEV features across frames.
+    """
+    # Unwrap DataParallel if needed
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    # Check for streaming_bev attribute
+    return hasattr(model, 'streaming_bev') and model.streaming_bev
+
+
+def reset_bev_memory(model, logger=None):
+    """
+    BEV memory will auto-reset when scene changes.
+    The StreamTensorMemory.get() method detects scene changes via scene_name
+    and calls reset_single() automatically (line 52-55 in memory_buffer.py).
+    This function just logs for visibility.
+    """
+    if logger:
+        logger.info('  ✓ BEV memory will auto-reset on scene change')
+    return True
+
+
+def group_samples_by_scene(dataset, logger=None):
+    """
+    Group dataset samples by scene and sort by timestamp/index within each scene.
+    Returns dict: {scene_token: [(idx, sample_info), ...]}
+    """
+    from collections import defaultdict
+    
+    scenes = defaultdict(list)
+    
+    for idx in range(len(dataset)):
+        # Get sample info from dataset
+        sample_info = dataset.samples[idx]
+        
+        # Extract scene identifier
+        scene_token = sample_info.get('scene_name') or sample_info.get('scene_token', 'default_scene')
+        
+        # Use sample_idx or frame_idx as timestamp, fallback to idx
+        timestamp = sample_info.get('sample_idx', sample_info.get('frame_idx', idx))
+        
+        scenes[scene_token].append((timestamp, idx, sample_info))
+    
+    # Sort each scene by timestamp
+    for scene_token in scenes:
+        scenes[scene_token].sort(key=lambda x: x[0])
+    
+    if logger:
+        logger.info(f'Grouped {len(dataset)} samples into {len(scenes)} scenes')
+        scene_sizes = [len(samples) for samples in scenes.values()]
+        logger.info(f'  Scene sizes: min={min(scene_sizes)}, max={max(scene_sizes)}, avg={sum(scene_sizes)/len(scene_sizes):.1f}')
+    
+    return scenes
+
+
 # ==================== INFERENCE CODE ====================
 def run_streammapnet_inference(
     config_path: str,
@@ -486,206 +545,381 @@ def run_streammapnet_inference(
     # Storage for predictions
     predictions = {}
     
-    # Run inference
-    logger.info('\nRunning inference...')
-    prog_bar = mmcv.ProgressBar(len(dataset))
+    # Check if model uses streaming/temporal features
+    use_streaming = is_streaming_model(model)
     
-    for i, data in enumerate(data_loader):
-        try:
-            # Handle DataContainer: data['img_metas'] is a DataContainer
-            # data['img_metas'].data[0] is the batch, [0] is the first item in batch
-            img_metas = data['img_metas'].data[0]
-            
-            # Get sample token - use the actual NuScenes sample_token if available
-            # Debug: print available keys on first sample
-            if i == 0:
-                logger.info(f"DEBUG: img_metas[0] keys: {list(img_metas[0].keys())}")
-            
-            # Try to get token from img_metas (StreamMapNet format)
-            if 'token' in img_metas[0]:
-                sample_token = img_metas[0]['token']
-            elif 'sample_idx' in img_metas[0]:
-                # sample_idx might be the token in some formats
-                sample_token = str(img_metas[0]['sample_idx'])
-            else:
-                # Fallback: try to get from dataset directly
-                if hasattr(dataset, 'samples') and i < len(dataset.samples):
-                    sample_token = dataset.samples[i].get('token', f'sample_{i}')
-                else:
-                    # Last resort: use index
-                    sample_token = f'sample_{i}'
-                    logger.warning(f"Could not find token for sample {i}, using {sample_token}")
-            
-            if i == 0:
-                logger.info(f"DEBUG: Using sample_token: {sample_token}")
-                logger.info(f"DEBUG: img_metas[0] has token: {'token' in img_metas[0]}")
-                if 'token' in img_metas[0]:
-                    logger.info(f"DEBUG: token value: {img_metas[0]['token']}")
-            
-            # Zero out inactive cameras using in-place modification (matches original approach)
-            # NuScenes camera order: CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT,
-            #                        CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT
-            if len(camera_indices) < 6 and 'img' in data:
-                # Handle DataContainer: data['img'] is a DataContainer
-                if hasattr(data['img'], 'data'):
-                    imgs = data['img'].data[0]  # Shape: [B, N_views, C, H, W] or [N_views, C, H, W]
-                else:
-                    imgs = data['img'][0].data[0]
-                
-                if i == 0:
-                    logger.info(f"DEBUG: Image tensor shape: {imgs.shape}")
-                    logger.info(f"DEBUG: Keeping camera indices {camera_indices}, zeroing out others")
-                
-                # Zero out inactive cameras by setting them to zero in-place
-                # This matches the original approach but generalized for any camera subset
-                if len(imgs.shape) == 5:  # [B, N_views, C, H, W]
-                    for view_idx in range(imgs.shape[1]):
-                        if view_idx not in camera_indices:
-                            imgs[:, view_idx, :, :, :] = 0
-                elif len(imgs.shape) == 4:  # [N_views, C, H, W]
-                    for view_idx in range(imgs.shape[0]):
-                        if view_idx not in camera_indices:
-                            imgs[view_idx, :, :, :] = 0
-                else:
-                    logger.warning(f"Unexpected image tensor shape: {imgs.shape}")
-            
-            # Run inference
-            with torch.no_grad():
-                result = model(return_loss=False, rescale=True, **data)
-            
-            # Debug: print result structure on first sample
-            if i == 0:
-                logger.info(f"DEBUG: result type: {type(result)}")
-                logger.info(f"DEBUG: result length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
-                if isinstance(result, (list, tuple)) and len(result) > 0:
-                    logger.info(f"DEBUG: result[0] type: {type(result[0])}")
-                    logger.info(f"DEBUG: result[0] keys: {list(result[0].keys()) if isinstance(result[0], dict) else 'Not a dict'}")
-            
-            # Extract predictions from StreamMapNet result format
-            # StreamMapNet's post_process returns: [{'vectors': np.array, 'scores': np.array, 'labels': np.array, 'token': str}]
-            # Since batch_size=1, result[0] is the dict for the first (and only) sample
-            if isinstance(result, (list, tuple)) and len(result) > 0:
-                result_item = result[0]
-                if isinstance(result_item, dict):
-                    # StreamMapNet format: {'vectors': np.array(shape=[num_preds, num_points, 2]),
-                    #                      'scores': np.array(shape=[num_preds]),
-                    #                      'labels': np.array(shape=[num_preds])}
-                    if 'vectors' in result_item:
-                        pred_vectors = result_item['vectors']  # Already numpy array
-                        pred_scores = result_item['scores']    # Already numpy array
-                        pred_labels = result_item['labels']    # Already numpy array
-                    # MapTR format: {'pts_bbox': {'pts_3d': ..., 'scores_3d': ..., 'labels_3d': ...}}
-                    elif 'pts_bbox' in result_item:
-                        result_dic = result_item['pts_bbox']
-                        pred_vectors = result_dic.get('pts_3d')
-                        pred_scores = result_dic.get('scores_3d')
-                        pred_labels = result_dic.get('labels_3d')
-                        # Convert to numpy if tensors
-                        if torch.is_tensor(pred_vectors):
-                            pred_vectors = pred_vectors.cpu().numpy()
-                        if torch.is_tensor(pred_scores):
-                            pred_scores = pred_scores.cpu().numpy()
-                        if torch.is_tensor(pred_labels):
-                            pred_labels = pred_labels.cpu().numpy()
-                    else:
-                        # Debug: show what we have
-                        if i == 0:
-                            logger.error(f"DEBUG: Unknown result structure. Available keys: {list(result_item.keys())}")
-                        raise KeyError(f"Could not find prediction data in result. Available keys: {list(result_item.keys())}")
-                else:
-                    raise TypeError(f"result[0] is not a dict, got {type(result_item)}")
-            else:
-                raise TypeError(f"result is not a list/tuple or is empty, got {type(result)}")
-            
-            # Ensure numpy arrays
-            if not isinstance(pred_vectors, np.ndarray):
-                pred_vectors = np.array(pred_vectors)
-            if not isinstance(pred_scores, np.ndarray):
-                pred_scores = np.array(pred_scores)
-            if not isinstance(pred_labels, np.ndarray):
-                pred_labels = np.array(pred_labels)
-            
-            # Filter by score threshold
-            if len(pred_scores) > 0:
-                keep = pred_scores > score_thresh
-                pred_vectors = pred_vectors[keep]
-                pred_labels = pred_labels[keep]
-                pred_scores = pred_scores[keep]
-            else:
-                # Empty predictions
-                pred_vectors = np.array([]).reshape(0, 20, 2) if len(pred_vectors.shape) == 3 else np.array([])
-                pred_labels = np.array([])
-                pred_scores = np.array([])
-            
-            # Denormalize coordinates from [0, 1] to world coordinates (meters)
-            # StreamMapNet outputs normalized coordinates, need to convert back using pc_range
-            # Formula: world_coord = normalized_coord * (max - min) + min
-            # NOTE: MapTR denormalizes in bbox_coder.decode(), so MapTR saves denormalized results
-            # StreamMapNet does NOT denormalize in post_process(), so we need to do it here
-            if len(pred_vectors) > 0 and pred_vectors.shape[-1] == 2:
-                # Get pc_range from config (it's defined as a variable, not a dict key)
-                # Try multiple ways to get it
-                if hasattr(cfg, 'pc_range'):
-                    pc_range = cfg.pc_range
-                elif 'pc_range' in cfg:
-                    pc_range = cfg['pc_range']
-                else:
-                    # Default: calculate from roi_size if available
-                    if hasattr(cfg, 'roi_size'):
-                        roi_size = cfg.roi_size
-                        pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
-                    else:
-                        # Fallback to default
-                        pc_range = [-30.0, -15.0, -3.0, 30.0, 15.0, 5.0]
-                
-                if len(pc_range) >= 6:
-                    x_min, y_min = pc_range[0], pc_range[1]
-                    x_max, y_max = pc_range[3], pc_range[4]
-                    
-                    if i == 0:
-                        logger.info(f"DEBUG: Before denormalization - vectors shape: {pred_vectors.shape}")
-                        logger.info(f"DEBUG: Before denormalization - X range: [{pred_vectors[..., 0].min():.4f}, {pred_vectors[..., 0].max():.4f}], "
-                                   f"Y range: [{pred_vectors[..., 1].min():.4f}, {pred_vectors[..., 1].max():.4f}]")
-                        logger.info(f"DEBUG: First normalized vector: {pred_vectors[0] if len(pred_vectors) > 0 else 'Empty'}")
-                        logger.info(f"DEBUG: pc_range: {pc_range}, using x_range=[{x_min}, {x_max}], y_range=[{y_min}, {y_max}]")
-                    
-                    # Denormalize: world = normalized * (max - min) + min
-                    pred_vectors = pred_vectors.copy()  # Avoid modifying original
-                    pred_vectors[..., 0] = pred_vectors[..., 0] * (x_max - x_min) + x_min
-                    pred_vectors[..., 1] = pred_vectors[..., 1] * (y_max - y_min) + y_min
-                    
-                    if i == 0:
-                        logger.info(f"DEBUG: After denormalization - X range: [{pred_vectors[..., 0].min():.2f}, {pred_vectors[..., 0].max():.2f}], "
-                                   f"Y range: [{pred_vectors[..., 1].min():.2f}, {pred_vectors[..., 1].max():.2f}]")
-                        logger.info(f"DEBUG: First denormalized vector: {pred_vectors[0] if len(pred_vectors) > 0 else 'Empty'}")
-                    
-                    # Apply 90-degree counterclockwise rotation to align with MapTR coordinate system
-                    # StreamMapNet uses: X ∈ [-30, 30], Y ∈ [-15, 15]
-                    # MapTR uses: X ∈ [-15, 15], Y ∈ [-30, 30]
-                    # Rotation: (x, y) -> (-y, x)
-                    pred_vectors_rotated = pred_vectors.copy()
-                    pred_vectors_rotated[..., 0] = -pred_vectors[..., 1]  # new_x = -old_y
-                    pred_vectors_rotated[..., 1] = pred_vectors[..., 0]   # new_y = old_x
-                    pred_vectors = pred_vectors_rotated
-                    
-                    if i == 0:
-                        logger.info(f"DEBUG: After 90° rotation to MapTR coords - X range: [{pred_vectors[..., 0].min():.2f}, {pred_vectors[..., 0].max():.2f}], "
-                                   f"Y range: [{pred_vectors[..., 1].min():.2f}, {pred_vectors[..., 1].max():.2f}]")
-                        logger.info(f"DEBUG: First rotated vector: {pred_vectors[0] if len(pred_vectors) > 0 else 'Empty'}")
-                        if len(pred_scores) > 0:
-                            logger.info(f"DEBUG: Number of vectors after filtering: {len(pred_vectors)}, scores range: [{pred_scores.min():.4f}, {pred_scores.max():.4f}]")
-            
-            # Store predictions
-            predictions[sample_token] = {
-                'vectors': pred_vectors,
-                'labels': pred_labels,
-                'scores': pred_scores
-            }
-            
-        except Exception as e:
-            logger.warning(f'Error processing sample {i}: {str(e)}')
+    if use_streaming:
+        logger.info('\n' + '='*80)
+        logger.info('⚠️  STREAMING MODEL DETECTED')
+        logger.info('='*80)
+        logger.info('Model uses temporal BEV features - processing with scene-based continuity')
+        logger.info('This matches the official StreamMapNet evaluation protocol.')
         
-        prog_bar.update()
+        # Group samples by scene for sequential processing
+        scenes = group_samples_by_scene(dataset, logger)
+        
+        logger.info('\nRunning inference with temporal continuity...')
+        total_samples = sum(len(samples) for samples in scenes.values())
+        prog_bar = mmcv.ProgressBar(total_samples)
+        
+        # Process each scene sequentially
+        for scene_idx, (scene_token, scene_samples) in enumerate(scenes.items()):
+            # Reset BEV memory at start of each scene
+            logger.info(f'\nScene {scene_idx+1}/{len(scenes)}: {scene_token} ({len(scene_samples)} samples)')
+            reset_bev_memory(model, logger)
+            
+            # Process samples sequentially within this scene
+            for timestamp, dataset_idx, sample_info in scene_samples:
+                # Get data from dataloader by index
+                # Note: We need to manually get the data since we're not iterating the dataloader
+                data = dataset[dataset_idx]
+                
+                # Wrap in batch dimension and move to device
+                for key in data.keys():
+                    if isinstance(data[key], torch.Tensor):
+                        data[key] = data[key].unsqueeze(0).cuda()
+                    elif hasattr(data[key], 'data'):  # DataContainer
+                        # Ensure DataContainer contents are on GPU
+                        if isinstance(data[key].data, list):
+                            data[key].data = [d.unsqueeze(0).cuda() if isinstance(d, torch.Tensor) else d for d in data[key].data]
+                        elif isinstance(data[key].data, torch.Tensor):
+                            data[key].data = data[key].data.unsqueeze(0).cuda()
+                
+                try:
+                    # Handle DataContainer
+                    if hasattr(data['img_metas'], 'data'):
+                        img_metas = data['img_metas'].data[0]
+                    else:
+                        img_metas = [data['img_metas']]
+                    
+                    # Get sample token
+                    if 'token' in img_metas[0]:
+                        sample_token = img_metas[0]['token']
+                    elif 'sample_idx' in img_metas[0]:
+                        sample_token = str(img_metas[0]['sample_idx'])
+                    else:
+                        sample_token = sample_info.get('token', f'sample_{dataset_idx}')
+                    
+                    # Zero out inactive cameras if needed
+                    if len(camera_indices) < 6 and 'img' in data:
+                        if hasattr(data['img'], 'data'):
+                            imgs = data['img'].data[0]
+                        else:
+                            imgs = data['img']
+                        
+                        # Zero out inactive cameras
+                        if len(imgs.shape) == 5:  # [B, N_views, C, H, W]
+                            for view_idx in range(imgs.shape[1]):
+                                if view_idx not in camera_indices:
+                                    imgs[:, view_idx, :, :, :] = 0
+                        elif len(imgs.shape) == 4:  # [N_views, C, H, W]
+                            for view_idx in range(imgs.shape[0]):
+                                if view_idx not in camera_indices:
+                                    imgs[view_idx, :, :, :] = 0
+                    
+                    # Run inference (temporal state is maintained automatically by model)
+                    with torch.no_grad():
+                        result = model(return_loss=False, rescale=True, **data)
+                    
+                    # Extract predictions
+                    if isinstance(result, (list, tuple)) and len(result) > 0:
+                        result_item = result[0]
+                        if isinstance(result_item, dict):
+                            if 'vectors' in result_item:
+                                pred_vectors = result_item['vectors']
+                                pred_scores = result_item['scores']
+                                pred_labels = result_item['labels']
+                            elif 'pts_bbox' in result_item:
+                                result_dic = result_item['pts_bbox']
+                                pred_vectors = result_dic.get('pts_3d')
+                                pred_scores = result_dic.get('scores_3d')
+                                pred_labels = result_dic.get('labels_3d')
+                                if torch.is_tensor(pred_vectors):
+                                    pred_vectors = pred_vectors.cpu().numpy()
+                                if torch.is_tensor(pred_scores):
+                                    pred_scores = pred_scores.cpu().numpy()
+                                if torch.is_tensor(pred_labels):
+                                    pred_labels = pred_labels.cpu().numpy()
+                            else:
+                                raise KeyError(f"Unknown result structure: {list(result_item.keys())}")
+                        else:
+                            raise TypeError(f"result[0] is not a dict: {type(result_item)}")
+                    else:
+                        raise TypeError(f"result is not a list/tuple: {type(result)}")
+                    
+                    # Ensure numpy arrays
+                    if not isinstance(pred_vectors, np.ndarray):
+                        pred_vectors = np.array(pred_vectors)
+                    if not isinstance(pred_scores, np.ndarray):
+                        pred_scores = np.array(pred_scores)
+                    if not isinstance(pred_labels, np.ndarray):
+                        pred_labels = np.array(pred_labels)
+                    
+                    # Filter by score threshold
+                    if len(pred_scores) > 0:
+                        keep = pred_scores > score_thresh
+                        pred_vectors = pred_vectors[keep]
+                        pred_labels = pred_labels[keep]
+                        pred_scores = pred_scores[keep]
+                    else:
+                        # Empty predictions
+                        pred_vectors = np.array([]).reshape(0, 20, 2) if len(pred_vectors.shape) == 3 else np.array([])
+                        pred_labels = np.array([])
+                        pred_scores = np.array([])
+                    
+                    # Denormalize and rotate coordinates (same as before)
+                    if len(pred_vectors) > 0 and pred_vectors.shape[-1] == 2:
+                        if hasattr(cfg, 'pc_range'):
+                            pc_range = cfg.pc_range
+                        elif 'pc_range' in cfg:
+                            pc_range = cfg['pc_range']
+                        else:
+                            if hasattr(cfg, 'roi_size'):
+                                roi_size = cfg.roi_size
+                                pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
+                            else:
+                                pc_range = [-30.0, -15.0, -3.0, 30.0, 15.0, 5.0]
+                        
+                        if len(pc_range) >= 6:
+                            x_min, y_min = pc_range[0], pc_range[1]
+                            x_max, y_max = pc_range[3], pc_range[4]
+                            
+                            # Denormalize
+                            pred_vectors = pred_vectors.copy()
+                            pred_vectors[..., 0] = pred_vectors[..., 0] * (x_max - x_min) + x_min
+                            pred_vectors[..., 1] = pred_vectors[..., 1] * (y_max - y_min) + y_min
+                            
+                            # Rigorous Coordinate Transformation: Ego -> Lidar (Inverse of Lidar2Ego)
+                            token = sample_token
+                            lidar2ego_rot = None
+                            lidar2ego_trans = None
+                            
+                            # Find sample data
+                            for sample in dataset.samples:
+                                if sample.get('token') == token:
+                                    lidar2ego_rot = sample.get('lidar2ego_rotation')
+                                    lidar2ego_trans = sample.get('lidar2ego_translation')
+                                    break
+                            
+                            if lidar2ego_rot is not None and lidar2ego_trans is not None:
+                                # 1. Construct 4x4 Lidar2Ego Matrix
+                                l2e_r = Quaternion(lidar2ego_rot).rotation_matrix
+                                l2e_t = np.array(lidar2ego_trans)
+                                
+                                l2e_mat = np.eye(4)
+                                l2e_mat[:3, :3] = l2e_r
+                                l2e_mat[:3, 3] = l2e_t
+                                
+                                # 2. Invert to get Ego2Lidar Matrix
+                                e2l_mat = np.linalg.inv(l2e_mat)
+                                
+                                # 3. Apply transformation to predictions (N_inst, N_pts, 2)
+                                # Flatten to (N_total, 2)
+                                original_shape = pred_vectors.shape
+                                preds_flat = pred_vectors.reshape(-1, 2)
+                                
+                                # Add Z=0 and Homogeneous coord=1
+                                num_points = preds_flat.shape[0]
+                                preds_homo = np.zeros((num_points, 4))
+                                preds_homo[:, 0] = preds_flat[:, 0]
+                                preds_homo[:, 1] = preds_flat[:, 1]
+                                preds_homo[:, 2] = 0.0 
+                                preds_homo[:, 3] = 1.0
+                                
+                                # Transform: P_lidar = E2L @ P_ego
+                                preds_lidar = (e2l_mat @ preds_homo.T).T
+                                
+                                # Reshape back to (N_inst, N_pts, 2)
+                                pred_vectors = preds_lidar[:, :2].reshape(original_shape)
+                                logger.info(f'Applied Full Ego->Lidar Transform')
+                            else:
+                                # Fallback
+                                pred_vectors_rotated = pred_vectors.copy()
+                                pred_vectors_rotated[..., 0] = -pred_vectors[..., 1]
+                                pred_vectors_rotated[..., 1] = pred_vectors[..., 0]
+                                pred_vectors = pred_vectors_rotated
+                    
+                    # Store predictions
+                    predictions[sample_token] = {
+                        'vectors': pred_vectors,
+                        'labels': pred_labels,
+                        'scores': pred_scores
+                    }
+                    
+                except Exception as e:
+                    logger.warning(f'Error processing sample {dataset_idx}: {str(e)}')
+                
+                prog_bar.update()
+    
+    else:
+        # Non-streaming model: use simple independent processing
+        logger.info('\nRunning inference (frame-independent)...')
+        prog_bar = mmcv.ProgressBar(len(dataset))
+        
+        for i, data in enumerate(data_loader):
+            try:
+                # [Keep the original inference code for non-streaming models]
+                # This is the same as the old loop
+                img_metas = data['img_metas'].data[0]
+                
+                if 'token' in img_metas[0]:
+                    sample_token = img_metas[0]['token']
+                elif 'sample_idx' in img_metas[0]:
+                    sample_token = str(img_metas[0]['sample_idx'])
+                else:
+                    if hasattr(dataset, 'samples') and i < len(dataset.samples):
+                        sample_token = dataset.samples[i].get('token', f'sample_{i}')
+                    else:
+                        sample_token = f'sample_{i}'
+                
+                # Zero out inactive cameras
+                if len(camera_indices) < 6 and 'img' in data:
+                    if hasattr(data['img'], 'data'):
+                        imgs = data['img'].data[0]
+                    else:
+                        imgs = data['img'][0].data[0]
+                    
+                    if len(imgs.shape) == 5:
+                        for view_idx in range(imgs.shape[1]):
+                            if view_idx not in camera_indices:
+                                imgs[:, view_idx, :, :, :] = 0
+                    elif len(imgs.shape) == 4:
+                        for view_idx in range(imgs.shape[0]):
+                            if view_idx not in camera_indices:
+                                imgs[view_idx, :, :, :] = 0
+                
+                # Run inference
+                with torch.no_grad():
+                    result = model(return_loss=False, rescale=True, **data)
+                
+                # Extract predictions
+                if isinstance(result, (list, tuple)) and len(result) > 0:
+                    result_item = result[0]
+                    if isinstance(result_item, dict):
+                        if 'vectors' in result_item:
+                            pred_vectors = result_item['vectors']
+                            pred_scores = result_item['scores']
+                            pred_labels = result_item['labels']
+                        elif 'pts_bbox' in result_item:
+                            result_dic = result_item['pts_bbox']
+                            pred_vectors = result_dic.get('pts_3d')
+                            pred_scores = result_dic.get('scores_3d')
+                            pred_labels = result_dic.get('labels_3d')
+                            if torch.is_tensor(pred_vectors):
+                                pred_vectors = pred_vectors.cpu().numpy()
+                            if torch.is_tensor(pred_scores):
+                                pred_scores = pred_scores.cpu().numpy()
+                            if torch.is_tensor(pred_labels):
+                                pred_labels = pred_labels.cpu().numpy()
+                        else:
+                            raise KeyError(f"Unknown result structure: {list(result_item.keys())}")
+                    else:
+                        raise TypeError(f"result[0] is not a dict: {type(result_item)}")
+                else:
+                    raise TypeError(f"result is not a list/tuple: {type(result)}")
+                
+                # Ensure numpy arrays
+                if not isinstance(pred_vectors, np.ndarray):
+                    pred_vectors = np.array(pred_vectors)
+                if not isinstance(pred_scores, np.ndarray):
+                    pred_scores = np.array(pred_scores)
+                if not isinstance(pred_labels, np.ndarray):
+                    pred_labels = np.array(pred_labels)
+                
+                # Filter by score threshold
+                if len(pred_scores) > 0:
+                    keep = pred_scores > score_thresh
+                    pred_vectors = pred_vectors[keep]
+                    pred_labels = pred_labels[keep]
+                    pred_scores = pred_scores[keep]
+                else:
+                    pred_vectors = np.array([]).reshape(0, 20, 2) if len(pred_vectors.shape) == 3 else np.array([])
+                    pred_labels = np.array([])
+                    pred_scores = np.array([])
+                
+                # Denormalize and rotate
+                if len(pred_vectors) > 0 and pred_vectors.shape[-1] == 2:
+                    if hasattr(cfg, 'pc_range'):
+                        pc_range = cfg.pc_range
+                    elif 'pc_range' in cfg:
+                        pc_range = cfg['pc_range']
+                    else:
+                        if hasattr(cfg, 'roi_size'):
+                            roi_size = cfg.roi_size
+                            pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
+                        else:
+                            pc_range = [-30.0, -15.0, -3.0, 30.0, 15.0, 5.0]
+                    
+                    if len(pc_range) >= 6:
+                        x_min, y_min = pc_range[0], pc_range[1]
+                        x_max, y_max = pc_range[3], pc_range[4]
+                        
+                        pred_vectors = pred_vectors.copy()
+                        pred_vectors[..., 0] = pred_vectors[..., 0] * (x_max - x_min) + x_min
+                        pred_vectors[..., 1] = pred_vectors[..., 1] * (y_max - y_min) + y_min
+                        
+                        # Rigorous Coordinate Transformation: Ego -> Lidar (Inverse of Lidar2Ego)
+                        token = sample_token
+                        lidar2ego_rot = None
+                        lidar2ego_trans = None
+                        
+                        # Find sample data
+                        for sample in dataset.samples:
+                            if sample.get('token') == token:
+                                lidar2ego_rot = sample.get('lidar2ego_rotation')
+                                lidar2ego_trans = sample.get('lidar2ego_translation')
+                                break
+                        
+                        if lidar2ego_rot is not None and lidar2ego_trans is not None:
+                            # 1. Construct 4x4 Lidar2Ego Matrix
+                            l2e_r = Quaternion(lidar2ego_rot).rotation_matrix
+                            l2e_t = np.array(lidar2ego_trans)
+                            
+                            l2e_mat = np.eye(4)
+                            l2e_mat[:3, :3] = l2e_r
+                            l2e_mat[:3, 3] = l2e_t
+                            
+                            # 2. Invert to get Ego2Lidar Matrix
+                            e2l_mat = np.linalg.inv(l2e_mat)
+                            
+                            # 3. Apply transformation to predictions (N_inst, N_pts, 2)
+                            # Flatten to (N_total, 2)
+                            original_shape = pred_vectors.shape
+                            preds_flat = pred_vectors.reshape(-1, 2)
+                            
+                            # Add Z=0 and Homogeneous coord=1
+                            num_points = preds_flat.shape[0]
+                            preds_homo = np.zeros((num_points, 4))
+                            preds_homo[:, 0] = preds_flat[:, 0]
+                            preds_homo[:, 1] = preds_flat[:, 1]
+                            preds_homo[:, 2] = 0.0 
+                            preds_homo[:, 3] = 1.0
+                            
+                            # Transform: P_lidar = E2L @ P_ego
+                            preds_lidar = (e2l_mat @ preds_homo.T).T
+                            
+                            # Reshape back to (N_inst, N_pts, 2)
+                            pred_vectors = preds_lidar[:, :2].reshape(original_shape)
+                            logger.info(f'Applied Full Ego->Lidar Transform. Matrix:\n{e2l_mat}')
+                        else:
+                            # Fallback if no matrix found (should not happen)
+                            logger.warning("Could not find lidar2ego info, creating manual rotation fallback")
+                            pred_vectors_rotated = pred_vectors.copy()
+                            pred_vectors_rotated[..., 0] = -pred_vectors[..., 1]
+                            pred_vectors_rotated[..., 1] = pred_vectors[..., 0]
+                            pred_vectors = pred_vectors_rotated
+                
+                # Store predictions
+                predictions[sample_token] = {
+                    'vectors': pred_vectors,
+                    'labels': pred_labels,
+                    'scores': pred_scores
+                }
+                
+            except Exception as e:
+                logger.warning(f'Error processing sample {i}: {str(e)}')
+            
+            prog_bar.update()
     
     # Save predictions
     logger.info(f'\nSaving {len(predictions)} predictions to {output_pkl}...')
@@ -709,7 +943,7 @@ class CameraSpecificEvaluator:
         self,
         nuscenes_data_path: str,
         pc_range: List[float] = None,
-        num_sample_pts: int = 200,  # CRITICAL: Match original INTERP_NUM=200 for correct mAP!
+        num_sample_pts: int = 100,  # CRITICAL: Match MapTR/GeMap standard for comparable metrics
         thresholds_chamfer: List[float] = None,
         camera_names: List[str] = None
     ):
@@ -717,7 +951,7 @@ class CameraSpecificEvaluator:
         Args:
             nuscenes_data_path: Path to NuScenes dataset
             pc_range: BEV range [-x, -y, -z, x, y, z]
-            num_sample_pts: Number of points to resample vectors to (must match original: 200)
+            num_sample_pts: Number of points to resample vectors to (must match MapTR/GeMap: 100)
             thresholds_chamfer: Chamfer distance thresholds (MapTR uses [0.5, 1.0, 1.5])
             camera_names: List of camera names to evaluate
         """
@@ -1100,113 +1334,81 @@ class CameraSpecificEvaluator:
     
     def evaluate(self) -> Dict:
         """
-        Compute final metrics by aggregating ALL camera predictions (matches MapTR/GeMap).
-        
-        This aggregates predictions from all cameras per sample, then evaluates ONCE
-        per class, matching the original evaluation methodology for fair comparison.
+        Compute final metrics across all cameras and classes.
+        MATCHES MapTR/GeMap: Evaluate each camera separately, then average.
         """
         results = {}
         class_names = ['divider', 'ped_crossing', 'boundary']
         
-        # AGGREGATE: Merge all camera predictions per sample
-        print("\nAggregating predictions across all cameras...")
-        
-        aggregated_preds = []  # List of {vectors, labels, scores} per sample
-        aggregated_gts = []    # List of {vectors, labels} per sample
-        
-        num_samples = len(self.predictions_per_camera[self.camera_names[0]])
-        
-        for sample_idx in range(num_samples):
-            # Collect predictions from ALL cameras for this sample
-            sample_pred_vectors = []
-            sample_pred_labels = []
-            sample_pred_scores = []
+        for camera_name in self.camera_names:
+            camera_results = {}
+            all_aps = []
             
-            sample_gt_vectors = []
-            sample_gt_labels = []
+            camera_preds = self.predictions_per_camera[camera_name]
+            camera_gts = self.ground_truths_per_camera[camera_name]
             
-            for camera_name in self.camera_names:
-                pred_data = self.predictions_per_camera[camera_name][sample_idx]
-                gt_data = self.ground_truths_per_camera[camera_name][sample_idx]
+            # Evaluate each class
+            for class_id, class_name in enumerate(class_names):
+                class_results = {}
                 
-                # Append predictions
-                if len(pred_data['vectors']) > 0:
-                    sample_pred_vectors.append(pred_data['vectors'])
-                    sample_pred_labels.append(pred_data['labels'])
-                    sample_pred_scores.append(pred_data['scores'])
+                # Extract predictions and GT for this class
+                pred_vectors_list = []
+                pred_scores_list = []
+                gt_vectors_list = []
                 
-                # Append GT
-                if len(gt_data['vectors']) > 0:
-                    sample_gt_vectors.append(gt_data['vectors'])
-                    sample_gt_labels.append(gt_data['labels'])
-            
-            # Merge across cameras
-            if sample_pred_vectors:
-                merged_pred_vectors = np.vstack(sample_pred_vectors)
-                merged_pred_labels = np.concatenate(sample_pred_labels)
-                merged_pred_scores = np.concatenate(sample_pred_scores)
-            else:
-                merged_pred_vectors = np.array([]).reshape(0, self.num_sample_pts, 2)
-                merged_pred_labels = np.array([])
-                merged_pred_scores = np.array([])
-            
-            if sample_gt_vectors:
-                merged_gt_vectors = np.vstack(sample_gt_vectors)
-                merged_gt_labels = np.concatenate(sample_gt_labels)
-            else:
-                merged_gt_vectors = np.array([]).reshape(0, self.num_sample_pts, 2)
-                merged_gt_labels = np.array([])
-            
-            aggregated_preds.append({
-                'vectors': merged_pred_vectors,
-                'labels': merged_pred_labels,
-                'scores': merged_pred_scores
-            })
-            
-            aggregated_gts.append({
-                'vectors': merged_gt_vectors,
-                'labels': merged_gt_labels
-            })
-        
-        print(f"✓ Aggregated {num_samples} samples across {len(self.camera_names)} cameras")
-        
-        # EVALUATE: Compute metrics ONCE per class (like MapTR/GeMap)
-        all_aps = []
-        
-        for class_id, class_name in enumerate(class_names):
-            class_results = {}
-            
-            # Extract predictions and GT for this class across ALL samples
-            pred_vectors_list = []
-            pred_scores_list = []
-            gt_vectors_list = []
-            
-            for pred_data, gt_data in zip(aggregated_preds, aggregated_gts):
-                pred_mask = pred_data['labels'] == class_id
-                gt_mask = gt_data['labels'] == class_id
+                for pred_data, gt_data in zip(camera_preds, camera_gts):
+                    pred_mask = pred_data['labels'] == class_id
+                    gt_mask = gt_data['labels'] == class_id
+                    
+                    pred_vectors_list.append(pred_data['vectors'][pred_mask])
+                    pred_scores_list.append(pred_data['scores'][pred_mask])
+                    gt_vectors_list.append(gt_data['vectors'][gt_mask])
                 
-                pred_vectors_list.append(pred_data['vectors'][pred_mask])
-                pred_scores_list.append(pred_data['scores'][pred_mask])
-                gt_vectors_list.append(gt_data['vectors'][gt_mask])
-            
-            # Compute AP at each threshold
-            avg_cd = None
-            for threshold in self.thresholds_chamfer:
-                ap, cd = self.compute_ap_for_class(
-                    pred_vectors_list, pred_scores_list, gt_vectors_list, threshold)
+                # Compute AP at each threshold
+                avg_cd = None
+                for threshold in self.thresholds_chamfer:
+                    ap, cd = self.compute_ap_for_class(
+                        pred_vectors_list, pred_scores_list, gt_vectors_list, threshold)
+                    
+                    class_results[f'AP@{threshold}m'] = ap
+                    all_aps.append(ap)
+                    
+                    if avg_cd is None:
+                        avg_cd = cd
                 
-                class_results[f'AP@{threshold}m'] = ap
-                all_aps.append(ap)
+                class_results['avg_chamfer_distance'] = avg_cd if avg_cd is not None else float('inf')
                 
-                if avg_cd is None:
-                    avg_cd = cd
+                camera_results[class_name] = class_results
             
-            class_results['avg_chamfer_distance'] = avg_cd if avg_cd is not None else float('inf')
+            # Compute mAP
+            camera_results['mAP'] = np.mean(all_aps) if all_aps else 0.0
             
-            results[class_name] = class_results
+            results[camera_name] = camera_results
         
-        # Compute overall mAP (matches MapTR/GeMap methodology)
-        results['mAP'] = np.mean(all_aps) if all_aps else 0.0
+        # Compute average across cameras if multiple
+        if len(self.camera_names) > 1:
+            avg_results = {}
+            
+            for class_name in class_names:
+                class_avg = {}
+                for threshold in self.thresholds_chamfer:
+                    threshold_key = f'AP@{threshold}m'
+                    aps = [results[cam][class_name][threshold_key] 
+                           for cam in self.camera_names 
+                           if class_name in results[cam]]
+                    class_avg[threshold_key] = np.mean(aps) if aps else 0.0
+                
+                cds = [results[cam][class_name]['avg_chamfer_distance'] 
+                      for cam in self.camera_names 
+                      if class_name in results[cam] and results[cam][class_name]['avg_chamfer_distance'] != float('inf')]
+                class_avg['avg_chamfer_distance'] = np.mean(cds) if cds else float('inf')
+                
+                avg_results[class_name] = class_avg
+            
+            all_camera_maps = [results[cam]['mAP'] for cam in self.camera_names]
+            avg_results['mAP'] = np.mean(all_camera_maps) if all_camera_maps else 0.0
+            
+            results['AVERAGE'] = avg_results
         
         return results
 
@@ -1379,28 +1581,56 @@ Examples:
     
     # Print results
     print("\n" + "="*80)
-    print("EVALUATION RESULTS (Aggregated across all cameras)")
+    print("EVALUATION RESULTS")
     print("="*80)
     
     class_names = ['divider', 'ped_crossing', 'boundary']
     
-    if 'mAP' in results:
-        print(f"\n{'='*80}")
-        print(f"Overall mAP (all classes & thresholds): {results['mAP']:.4f}")
-        print(f"{'='*80}\n")
-    
-    for class_name in class_names:
-        if class_name not in results:
+    # Print per-camera results
+    for camera_name in evaluator.camera_names:
+        if camera_name not in results:
             continue
-        class_results = results[class_name]
-        print(f"{class_name}:")
-        for threshold in evaluator.thresholds_chamfer:
-            ap = class_results[f'AP@{threshold}m']
-            print(f"  AP@{threshold}m: {ap:.4f}")
-        cd = class_results['avg_chamfer_distance']
-        cd_str = f"{cd:.4f}m" if cd != float('inf') else "N/A"
-        print(f"  Avg CD: {cd_str}")
-        print()
+            
+        camera_results = results[camera_name]
+        print(f"\n{'='*80}")
+        print(f"{camera_name}")
+        print(f"{'='*80}")
+        
+        for class_name in class_names:
+            if class_name not in camera_results:
+                continue
+            class_results = camera_results[class_name]
+            print(f"\n{class_name}:")
+            for threshold in evaluator.thresholds_chamfer:
+                ap = class_results[f'AP@{threshold}m']
+                print(f"  AP@{threshold}m: {ap:.4f}")
+            cd = class_results['avg_chamfer_distance']
+            cd_str = f"{cd:.4f}m" if cd != float('inf') else "N/A"
+            print(f"  Avg CD: {cd_str}")
+        
+        print(f"\nmAP: {camera_results['mAP']:.4f}")
+    
+    # Print average results if multiple cameras
+    if 'AVERAGE' in results:
+        avg_results = results['AVERAGE']
+        print(f"\n{'='*80}")
+        print(f"AVERAGE (across {len(evaluator.camera_names)} cameras)")
+        print(f"{'='*80}")
+        
+        for class_name in class_names:
+            if class_name not in avg_results:
+                continue
+            class_results = avg_results[class_name]
+            print(f"\n{class_name}:")
+            for threshold in evaluator.thresholds_chamfer:
+                ap = class_results[f'AP@{threshold}m']
+                print(f"  AP@{threshold}m: {ap:.4f}")
+            cd = class_results['avg_chamfer_distance']
+            cd_str = f"{cd:.4f}m" if cd != float('inf') else "N/A"
+            print(f"  Avg CD: {cd_str}")
+        
+        print(f"\nmAP: {avg_results['mAP']:.4f}")
+        print(f"{'='*80}")
     
     # Save results
     print(f"\nSaving results to {args.output_json}...")

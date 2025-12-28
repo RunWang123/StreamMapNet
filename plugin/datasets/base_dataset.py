@@ -233,7 +233,7 @@ class BaseMapDataset(Dataset):
         return self._evaluate(result_path, logger=logger)
     
     def _evaluate(self, result_path, logger=None):
-        self.evaluator = VectorEvaluate(self.eval_config)
+        self.evaluator = VectorEvaluate(self.eval_config, n_workers=0) 
         result_dict = self.evaluator.evaluate(result_path, logger=logger)
         return result_dict
 
