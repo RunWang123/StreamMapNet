@@ -289,7 +289,11 @@ class CameraFOVClipper:
         return np.array(clipped_points), intersection_points
     
     def _backproject_image_point_to_ground_plane(self, u: float, v: float, extrinsics: np.ndarray, intrinsics: np.ndarray, lidar_height_above_ground: float = 1.84) -> np.ndarray:
-        """Back-project an image point to the actual ground plane"""
+        """Back-project an image point to the actual ground plane
+        
+        For downward-tilted cameras (like AV2), ground plane intersection may be behind camera.
+        In this case, project forward along the ray for max_range distance.
+        """
         # Unproject to normalized camera coordinates
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
@@ -307,18 +311,29 @@ class CameraFOVClipper:
         
         # Find intersection with actual ground plane (z = -lidar_height_above_ground in BEV coordinates)
         ground_plane_z = -lidar_height_above_ground
+        
+        # Check if ray is nearly parallel to ground
         if abs(ray_dir_world[2]) < 1e-6:
-            return np.array([cam_pos_world[0], cam_pos_world[1]])
+            # Ray parallel to ground - project forward by max_range
+            use_distance = self.max_range if self.max_range is not None else 50.0
+            intersection = cam_pos_world + use_distance * ray_dir_world
+            return np.array([intersection[0], intersection[1]])
         
         t = (ground_plane_z - cam_pos_world[2]) / ray_dir_world[2]
-        if t < 0:
-            # Use max_range if provided, otherwise default to 100.0
-            t = self.max_range if self.max_range is not None else 100.0
-        elif self.max_range is not None and t > self.max_range:
-            # Clamp to max_range if provided
-            t = self.max_range
         
-        intersection = cam_pos_world + t * ray_dir_world
+        # Handle different cases
+        if t < 0:
+            # Ground plane intersection is BEHIND camera (common for downward-tilted cameras)
+            # Project FORWARD along ray direction instead
+            use_distance = self.max_range if self.max_range is not None else 50.0
+            intersection = cam_pos_world + use_distance * ray_dir_world
+        elif self.max_range is not None and t > self.max_range:
+            # Intersection too far - clamp to max_range
+            intersection = cam_pos_world + self.max_range * ray_dir_world
+        else:
+            # Normal case: ground plane intersection in front of camera
+            intersection = cam_pos_world + t * ray_dir_world
+        
         return np.array([intersection[0], intersection[1]])
     
     def _backproject_linestring_to_world(self, geometry, extrinsics: np.ndarray, intrinsics: np.ndarray) -> List[np.ndarray]:
@@ -602,15 +617,18 @@ def extract_gt_vectors(sample_info: Dict, nuscenes_path: str, pc_range: list, fi
     lidar2ego[:3, 3] = sample_info['lidar2ego_translation']
     
     ego2global = np.eye(4)
-    ego2global[:3, :3] = Quaternion(sample_info['ego2global_rotation']).rotation_matrix
-    ego2global[:3, 3] = sample_info['ego2global_translation']
+    e2g_rot = sample_info.get('ego2global_rotation') or sample_info.get('e2g_rotation')
+    e2g_trans = sample_info.get('ego2global_translation') or sample_info.get('e2g_translation')
+    
+    ego2global[:3, :3] = Quaternion(e2g_rot).rotation_matrix
+    ego2global[:3, 3] = e2g_trans
     
     lidar2global = ego2global @ lidar2ego
     lidar2global_translation = list(lidar2global[:3, 3])
     lidar2global_rotation = list(Quaternion(matrix=lidar2global).q)
     
     # Extract location
-    location = sample_info['map_location']
+    location = sample_info.get('map_location') or sample_info.get('location')
     
     # Generate vectorized map (returns Shapely LineString objects)
     anns_results = vector_map.gen_vectorized_samples(
@@ -689,8 +707,11 @@ def extract_gt_with_fov_clipping(
     cam2ego[:3, 3] = cam_info['sensor2ego_translation']
     
     ego2global = np.eye(4)
-    ego2global[:3, :3] = Quaternion(sample_info['ego2global_rotation']).rotation_matrix
-    ego2global[:3, 3] = sample_info['ego2global_translation']
+    e2g_rot = sample_info.get('ego2global_rotation') or sample_info.get('e2g_rotation')
+    e2g_trans = sample_info.get('ego2global_translation') or sample_info.get('e2g_translation')
+    
+    ego2global[:3, :3] = Quaternion(e2g_rot).rotation_matrix
+    ego2global[:3, 3] = e2g_trans
     
     lidar2ego = np.eye(4)
     lidar2ego[:3, :3] = Quaternion(sample_info['lidar2ego_rotation']).rotation_matrix
@@ -847,8 +868,11 @@ def process_predictions_with_fov_clipping(
     cam2ego[:3, 3] = cam_info['sensor2ego_translation']
     
     ego2global = np.eye(4)
-    ego2global[:3, :3] = Quaternion(sample_info['ego2global_rotation']).rotation_matrix
-    ego2global[:3, 3] = sample_info['ego2global_translation']
+    e2g_rot = sample_info.get('ego2global_rotation') or sample_info.get('e2g_rotation')
+    e2g_trans = sample_info.get('ego2global_translation') or sample_info.get('e2g_translation')
+    
+    ego2global[:3, :3] = Quaternion(e2g_rot).rotation_matrix
+    ego2global[:3, 3] = e2g_trans
     
     lidar2ego = np.eye(4)
     lidar2ego[:3, :3] = Quaternion(sample_info['lidar2ego_rotation']).rotation_matrix
