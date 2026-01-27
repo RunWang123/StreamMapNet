@@ -1744,6 +1744,7 @@ def main():
     parser.add_argument('--nuscenes-path', type=str, default=None)
     parser.add_argument('--samples-pkl', type=str, default=None)
     parser.add_argument('--num-workers', type=int, default=os.cpu_count())
+    parser.add_argument('--skip-inference', action='store_true', help='Skip inference and use existing predictions')
     args = parser.parse_args()
     
     # Handle noise arguments
@@ -1765,11 +1766,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     predictions_pkl = os.path.join(args.output_dir, f"streammapnet_preds_noise_t{noise_trans_std}_r{noise_rot_std}.pkl")
-    run_streammapnet_inference(args.config, args.checkpoint, predictions_pkl, camera_indices, 
-                               samples_pkl=args.samples_pkl, 
-                               noise_trans_std=noise_trans_std, 
-                               noise_rot_std=noise_rot_std, 
-                               noise_seed=args.noise_seed)
+    
+    if not args.skip_inference:
+        run_streammapnet_inference(args.config, args.checkpoint, predictions_pkl, camera_indices, 
+                                   samples_pkl=args.samples_pkl, 
+                                   noise_trans_std=noise_trans_std, 
+                                   noise_rot_std=noise_rot_std, 
+                                   noise_seed=args.noise_seed)
+    elif not os.path.exists(predictions_pkl):
+        raise FileNotFoundError(f"Predictions file not found: {predictions_pkl}. Cannot skip inference.")
     
     # Evaluation
     print("\nSTEP 2: Eval")
