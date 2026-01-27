@@ -1765,7 +1765,20 @@ def main():
     camera_indices = parse_camera_config(args.cameras)
     os.makedirs(args.output_dir, exist_ok=True)
     
-    predictions_pkl = os.path.join(args.output_dir, f"streammapnet_preds_noise_t{noise_trans_std}_r{noise_rot_std}.pkl")
+    # Generate output filenames based on config
+    camera_suffix = "_".join(args.cameras).lower().replace("cam_", "")
+    if "all" in args.cameras or len(camera_indices) == 6:
+        camera_suffix = "all"
+    
+    noise_suffix = ""
+    if noise_trans_std > 0:
+        noise_suffix += f"_trans{noise_trans_std:.3f}"
+    if noise_rot_std > 0:
+        noise_suffix += f"_rot{noise_rot_std:.3f}"
+    if noise_trans_std == 0 and noise_rot_std == 0:
+        noise_suffix = "_baseline"
+        
+    predictions_pkl = os.path.join(args.output_dir, f"streammapnet_preds_{camera_suffix}{noise_suffix}.pkl")
     
     if not args.skip_inference:
         run_streammapnet_inference(args.config, args.checkpoint, predictions_pkl, camera_indices, 
