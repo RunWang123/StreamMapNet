@@ -1847,8 +1847,12 @@ def main():
             
     final_results = evaluator.evaluate()
     print(json.dumps(final_results, indent=2))
-    print(f"See {args.output_dir}/results.json")
-    with open(os.path.join(args.output_dir, 'results.json'), 'w') as f:
+    results_json = os.path.join(args.output_dir, f"streammapnet_results_{camera_suffix}{noise_suffix}.json")
+    
+    final_results = evaluator.evaluate()
+    print(json.dumps(final_results, indent=2))
+    print(f"See {results_json}")
+    with open(results_json, 'w') as f:
         json.dump(final_results, f, indent=2)
 
 if __name__ == '__main__':
