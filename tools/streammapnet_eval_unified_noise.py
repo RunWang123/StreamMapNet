@@ -170,6 +170,7 @@ def add_noise_to_camera_extrinsics(
         logger.info(f"Active cameras: {[list(CAMERA_MAP.keys())[i] for i in active_camera_indices]}")
         logger.info("="*80)
     
+    noise_applied = False
     for t_idx, img_meta in enumerate(img_metas_list):
         # StreamMapNet / NuscDataset typically has 'cam_extrinsics' (ego2cam) directly
         # Format: list of 4x4 arrays
@@ -208,7 +209,6 @@ def add_noise_to_camera_extrinsics(
             continue
         
         cam_names = list(CAMERA_MAP.keys())
-        noise_applied = False
         
         # Add noise to each active camera
         for cam_idx in active_camera_indices:
@@ -563,6 +563,17 @@ def run_streammapnet_inference(
         samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
         if samples_per_gpu > 1:
             cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
+            
+        # Patch pipeline to ensure we have extrinsics/intrinsics for noise injection
+        for transform in cfg.data.test.pipeline:
+            if transform['type'] == 'Collect3D':
+                if 'meta_keys' in transform:
+                    meta_keys = list(transform['meta_keys'])
+                    for key in ['cam_extrinsics', 'cam_intrinsics', 'lidar2img', 'lidar2ego_translation', 'lidar2ego_rotation']:
+                        if key not in meta_keys:
+                            meta_keys.append(key)
+                    transform['meta_keys'] = tuple(meta_keys)
+                    print(f"DEBUG: Patched Collect3D meta_keys: {transform['meta_keys']}")
     
     logger = get_root_logger()
     logger.info('Building dataset...')
@@ -697,7 +708,31 @@ def run_streammapnet_inference(
                             seed=noise_seed + global_frame_idx if noise_seed is not None else None,
                             logger=logger if global_frame_idx == 0 else None
                         )
-                        # No need to wrap back, just update in place
+                        
+                        # CRITICAL: Update the tensors in 'data' because the model uses them directly!
+                        # Update img_metas in data container
+                        if hasattr(data['img_metas'], 'data'):
+                             data['img_metas'].data[0] = img_metas
+                        
+                        # Update lidar2img tensor if present
+                        if 'lidar2img' in data:
+                            l2i_list = [m['lidar2img'] for m in img_metas]
+                            # l2i_list is list of lists of 4x4 arrays.
+                            # data['lidar2img'] is likely [1, N_views, 4, 4]
+                            
+                            new_l2i_tensor = torch.tensor(l2i_list).to(data['lidar2img'].device)
+                            if len(new_l2i_tensor.shape) == 3: # [N_views, 4, 4]
+                                new_l2i_tensor = new_l2i_tensor.unsqueeze(0)
+                            
+                            data['lidar2img'] = new_l2i_tensor
+                            
+                        # Update ego2img tensor if present (StreamMapNet often uses this)
+                        if 'ego2img' in data:
+                            e2i_list = [m['ego2img'] for m in img_metas]
+                            new_e2i_tensor = torch.tensor(e2i_list).to(data['ego2img'].device)
+                            if len(new_e2i_tensor.shape) == 3:
+                                new_e2i_tensor = new_e2i_tensor.unsqueeze(0)
+                            data['ego2img'] = new_e2i_tensor
                     
                     if 'token' in img_metas[0]:
                         sample_token = img_metas[0]['token']
@@ -815,6 +850,7 @@ def run_streammapnet_inference(
                 img_metas = data['img_metas'].data[0]
                 
                 # Extract sample token
+                # Extract sample token
                 if 'token' in img_metas[0]:
                     sample_token = img_metas[0]['token']
                 elif 'sample_idx' in img_metas[0]:
@@ -836,6 +872,31 @@ def run_streammapnet_inference(
                         logger=logger if i == 0 else None
                     )
                      data['img_metas'].data[0] = img_metas
+                     
+                     # CRITICAL: Update the tensors in 'data' dictionary as well
+                     # Update lidar2img tensor if present
+                     if 'lidar2img' in data:
+                        l2i_list = [m['lidar2img'] for m in img_metas]
+                        new_l2i_tensor = torch.tensor(l2i_list).to(data['lidar2img'].data[0].device if hasattr(data['lidar2img'], 'data') else data['lidar2img'].device)
+                        if len(new_l2i_tensor.shape) == 3: 
+                            new_l2i_tensor = new_l2i_tensor.unsqueeze(0)
+                        
+                        if hasattr(data['lidar2img'], 'data'):
+                             data['lidar2img'].data[0] = new_l2i_tensor
+                        else:
+                             data['lidar2img'] = new_l2i_tensor
+
+                     # Update ego2img tensor if present
+                     if 'ego2img' in data:
+                        e2i_list = [m['ego2img'] for m in img_metas]
+                        new_e2i_tensor = torch.tensor(e2i_list).to(data['ego2img'].data[0].device if hasattr(data['ego2img'], 'data') else data['ego2img'].device)
+                        if len(new_e2i_tensor.shape) == 3:
+                            new_e2i_tensor = new_e2i_tensor.unsqueeze(0)
+                            
+                        if hasattr(data['ego2img'], 'data'):
+                             data['ego2img'].data[0] = new_e2i_tensor
+                        else:
+                             data['ego2img'] = new_e2i_tensor
                 
                 # Run inference
                 # Zero out inactive cameras
@@ -1742,6 +1803,7 @@ def main():
     parser.add_argument('--num-sample-pts', type=int, default=100)
     parser.add_argument('--output-dir', type=str, default='eval_results_noise_stream')
     parser.add_argument('--nuscenes-path', type=str, default=None)
+    parser.add_argument('--predictions-pkl', type=str, default=None, help='Override path to predictions pickle file')
     parser.add_argument('--samples-pkl', type=str, default=None)
     parser.add_argument('--num-workers', type=int, default=os.cpu_count())
     parser.add_argument('--skip-inference', action='store_true', help='Skip inference and use existing predictions')
@@ -1778,9 +1840,16 @@ def main():
     if noise_trans_std == 0 and noise_rot_std == 0:
         noise_suffix = "_baseline"
         
-    predictions_pkl = os.path.join(args.output_dir, f"streammapnet_preds_{camera_suffix}{noise_suffix}.pkl")
+    if args.predictions_pkl:
+        predictions_pkl = args.predictions_pkl
+    else:
+        predictions_pkl = os.path.join(args.output_dir, f"streammapnet_preds_{camera_suffix}{noise_suffix}.pkl")
     
     if not args.skip_inference:
+        # If user provides a specific path but doesn't skip inference, use that path for output
+        if args.predictions_pkl:
+             print(f"Using provided path for output: {predictions_pkl}")
+        
         run_streammapnet_inference(args.config, args.checkpoint, predictions_pkl, camera_indices, 
                                    samples_pkl=args.samples_pkl, 
                                    noise_trans_std=noise_trans_std, 
