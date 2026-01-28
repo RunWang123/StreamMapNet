@@ -665,8 +665,8 @@ def run_inference_with_fov_clipping(
         label_counts[label] = label_counts.get(label, 0) + 1
     
     print(f"  Class distribution:")
-    print(f"    Divider: {label_counts.get(0, 0)}")
-    print(f"    Ped Crossing: {label_counts.get(1, 0)}")
+    print(f"    Divider: {label_counts.get(1, 0)}")
+    print(f"    Ped Crossing: {label_counts.get(0, 0)}")
     print(f"    Boundary: {label_counts.get(2, 0)}")
     
     return {
@@ -696,7 +696,7 @@ def visualize_scene_predictions(
         print(f"  Warning: No predictions to visualize")
         return
     
-    class_colors = {0: 'orange', 1: 'blue', 2: 'green'}
+    class_colors = {0: 'blue', 1: 'orange', 2: 'green'}
     
     fig, ax = plt.subplots(figsize=figsize)
     
